@@ -115,19 +115,27 @@ def match():
         if not data or 'image' not in data:
             return jsonify({"error": "No image"}), 400
 
-        # --- SAFE BASE64 DECODING (Fixes the multiple of 4 padding error) ---
-        base64_str = data['image'].split(',')[1] if ',' in data['image'] else data['image']
-        try:
-            missing_padding = len(base64_str) % 4
-            if missing_padding:
-                base64_str += '=' * (4 - missing_padding)
-            image_bytes = base64.b64decode(base64_str)
-            image_rgba = Image.open(io.BytesIO(image_bytes)).convert('RGBA')
-        except Exception as b64e:
-            print(f"❌ Base64 Decode Error: {str(b64e)}")
-            return jsonify({"error": "Invalid base64 image data"}), 400
+        image_data = data['image']
 
-        image_rgb = image_rgba.convert('RGB')
+        # --- SMART DATA DETECTOR: URL vs BASE64 ---
+        if image_data.startswith('http'):
+            print(f"🌐 Downloading image from URL: {image_data}")
+            resp = requests.get(image_data, timeout=15)
+            # Open binary data directly
+            image_rgb = Image.open(io.BytesIO(resp.content)).convert('RGB')
+        else:
+            print("📦 Processing Base64 data...")
+            # Safe Base64 Decoding (Fixes the multiple of 4 padding error)
+            base64_str = image_data.split(',')[1] if ',' in image_data else image_data
+            try:
+                missing_padding = len(base64_str) % 4
+                if missing_padding:
+                    base64_str += '=' * (4 - missing_padding)
+                image_bytes = base64.b64decode(base64_str)
+                image_rgb = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            except Exception as b64e:
+                print(f"❌ Base64 Decode Error: {str(b64e)}")
+                return jsonify({"error": "Invalid base64 image data"}), 400
         
         # --- EARLY RAM PROTECTION ---
         # Downscale immediately before loading AI models to prevent SIGKILL
@@ -149,12 +157,14 @@ def match():
         top_colors = sorted(color_counts, key=color_counts.get, reverse=True)[:3]
 
         print("📥 Initializing DETR detector...")
+        from transformers import pipeline
         detector = pipeline("object-detection", model="facebook/detr-resnet-50")
         final_image_for_ai = smart_crop(image_rgb, detector)
         del detector
         gc.collect()
 
         print("📥 Initializing DINOv2 extractor...")
+        from transformers import AutoImageProcessor, AutoModel
         processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base')
         model = AutoModel.from_pretrained('facebook/dinov2-base')
         model.eval()
@@ -167,7 +177,6 @@ def match():
         del processor, model
         gc.collect()
 
-        # Search Database using our Advanced Consensus SQL
         response = supabase.rpc('match_products_advanced', {
             'query_embedding': final_vector,
             'query_colors': top_colors,
