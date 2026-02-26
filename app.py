@@ -1,5 +1,5 @@
 import os
-# Force writable cache
+# Force writable cache for Leapcell
 CACHE_DIR = '/tmp/huggingface'
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.environ['HF_HOME'] = CACHE_DIR
@@ -43,12 +43,39 @@ def apply_clahe(image_rgb):
 def smart_crop(image_rgb, detector):
     image_rgb.thumbnail((800, 800))
     w, h = image_rgb.size
+    
+    print("🔍 Running DETR object detection...")
     detections = detector(image_rgb)
-    best = max([d for d in detections if d['score'] > 0.5], key=lambda x: x['score'], default=None)
+    
+    # Lowered threshold to 0.3 for smaller objects in busy frames
+    valid_detections = [d for d in detections if d['score'] > 0.3]
+    best = max(valid_detections, key=lambda x: x['score'], default=None)
+    
     if best:
-        b = best['box']
-        return image_rgb.crop((b['xmin'], b['ymin'], b['xmax'], b['ymax']))
-    return image_rgb.crop((w*0.1, h*0.1, w*0.9, h*0.9))
+        label = best.get('label', 'object')
+        score = best['score']
+        print(f"🎯 DETR Success: Found '{label}' with {score:.2f} confidence.")
+        
+        box = best['box']
+        # Add 10% padding to avoid cutting off edges
+        pad_w = (box['xmax'] - box['xmin']) * 0.1
+        pad_h = (box['ymax'] - box['ymin']) * 0.1
+        
+        left = max(0, box['xmin'] - pad_w)
+        top = max(0, box['ymin'] - pad_h)
+        right = min(w, box['xmax'] + pad_w)
+        bottom = min(h, box['ymax'] + pad_h)
+        
+        print(f"✂️ Cropping to bounding box with padding: ({int(left)}, {int(top)}, {int(right)}, {int(bottom)})")
+        return image_rgb.crop((left, top, right, bottom))
+    
+    # Center-Zoom Fallback
+    print("⚠️ DETR found no high-confidence objects. Applying 50% Center-Zoom fallback...")
+    left = w * 0.25
+    top = h * 0.25
+    right = w * 0.75
+    bottom = h * 0.75
+    return image_rgb.crop((left, top, right, bottom))
 
 @app.route('/')
 def health():
@@ -94,12 +121,12 @@ def match():
         del processor, model
         gc.collect()
 
-        # Step C: Database (Loosened threshold to 0.5 to find ANYTHING)
+        # Step C: Database
         print("🔎 Searching Supabase...")
         response = supabase.rpc('match_products_advanced', {
             'query_embedding': vector, 
             'query_colors': [], 
-            'match_threshold': 0.50, 
+            'match_threshold': 0.15,  # Lowered to 0.15 to allow DINOv2 matches through
             'match_count': 5
         }).execute()
         
