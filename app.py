@@ -22,16 +22,31 @@ CORS(app)
 # =========================================================
 print("📥 Loading AI Models into Global Memory...")
 
+# Define a writable cache directory for serverless environments
+CACHE_DIR = "/tmp/huggingface_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 # Load DETR for Smart Crop
-detector = pipeline("object-detection", model="facebook/detr-resnet-50")
+# Added cache_dir parameter
+detector = pipeline(
+    "object-detection", 
+    model="facebook/detr-resnet-50",
+    model_kwargs={"cache_dir": CACHE_DIR}
+)
 
 # Load DINOv2 for Vector Extraction
-processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base')
-model = AutoModel.from_pretrained('facebook/dinov2-base')
+# Added cache_dir parameter to both processor and model
+processor = AutoImageProcessor.from_pretrained(
+    'facebook/dinov2-base', 
+    cache_dir=CACHE_DIR
+)
+model = AutoModel.from_pretrained(
+    'facebook/dinov2-base', 
+    cache_dir=CACHE_DIR
+)
 model.eval()
 
 print("✅ All models loaded and ready.")
-
 # =========================================================
 # --- DATABASE INITIALIZATION ---
 # =========================================================
@@ -197,3 +212,4 @@ def vectorize_product():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
+
