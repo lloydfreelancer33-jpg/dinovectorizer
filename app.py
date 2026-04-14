@@ -211,6 +211,81 @@ def index_video_frame():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# --- NEW HELPER: PRECISE CROP FOR SEARCH ---
+
+def apply_bbox_crop(image_rgb, bbox):
+    """
+    Crops the image based on [ymin, xmin, ymax, xmax] coordinates from GPT.
+    Normalizes coordinates if they are in 0-1000 format (GPT standard).
+    """
+    w, h = image_rgb.size
+    ymin, xmin, ymax, xmax = bbox
+
+    # If GPT returns 0-1000 scale, convert to pixel scale
+    if max(bbox) > 1.1: 
+        left = (xmin / 1000) * w
+        top = (ymin / 1000) * h
+        right = (xmax / 1000) * w
+        bottom = (ymax / 1000) * h
+    else:
+        # Already normalized 0-1
+        left, top, right, bottom = xmin * w, ymin * h, xmax * w, ymax * h
+
+    return image_rgb.crop((left, top, right, bottom))
+
+# --- NEW ENDPOINT: REACTIVE PHASE 2 (Fast Search) ---
+
+@app.route('/search-frames', methods=['POST'])
+def search_frames():
+    """
+    Receives a screenshot and GPT-extracted coordinates.
+    Crops, vectorizes, and queries the product_frames library.
+    """
+    try:
+        if not init_db(): return jsonify({"error": "DB Init Failed"}), 500
+        data = request.get_json()
+        image_url = data.get('image_url')
+        bbox = data.get('bbox') # Expected [ymin, xmin, ymax, xmax]
+
+        # 1. Fetch and Crop
+        resp = requests.get(image_url, timeout=10)
+        full_img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+        
+        if bbox:
+            search_img = apply_bbox_crop(full_img, bbox)
+        else:
+            # Fallback if no bbox provided
+            search_img = full_img
+            search_img.thumbnail((512, 512))
+
+        # 2. Vectorize the Crop
+        # This uses the same global DINO model to avoid cold starts
+        vector = get_raw_vector(search_img)
+
+        # 3. Query the product_frames table specifically
+        # We use a new RPC 'match_video_frames' or reuse the advanced one
+        rpc_res = supabase.rpc('match_video_frames', {
+            'query_embedding': vector,
+            'match_threshold': 0.12, # Precision match
+            'match_count': 3
+        }).execute()
+
+        if rpc_res.data and len(rpc_res.data) > 0:
+            best_match = rpc_res.data[0]
+            return jsonify({
+                "status": "SUCCESS",
+                "best_match": {
+                    "product_id": best_match['product_id'],
+                    "confidence": best_match['similarity'],
+                    "frame_url": best_match['frame_url']
+                }
+            })
+
+        return jsonify({"status": "NO_FRAME_MATCH", "message": "No matching frames found in library."})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # OLD ENDPOINT (UNTOUCHED)
 @app.route('/match', methods=['POST'])
 def match():
