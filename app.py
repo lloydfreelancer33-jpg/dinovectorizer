@@ -17,6 +17,7 @@ from flask_cors import CORS
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModel, pipeline
 from openai import OpenAI
+from sklearn.cluster import KMeans # <-- Added for color extraction
 
 app = Flask(__name__)
 CORS(app)
@@ -65,6 +66,27 @@ def smart_crop(image_rgb, detector):
     return image_rgb.crop((w * 0.25, h * 0.25, w * 0.75, h * 0.75))
 
 # --- PHASE 2 HELPERS (PROACTIVE RAW MATCHING) ---
+
+def extract_dominant_colors(image_rgb, k=3):
+    """Extracts k dominant hex colors from an image using K-Means."""
+    try:
+        img = image_rgb.copy()
+        img.thumbnail((100, 100))
+        img_np = np.array(img)
+        pixels = img_np.reshape(-1, 3)
+
+        kmeans = KMeans(n_clusters=k, n_init=10)
+        kmeans.fit(pixels)
+        colors = kmeans.cluster_centers_.astype(int)
+
+        hex_colors = []
+        for color in colors:
+            hex_colors.append('#{:02x}{:02x}{:02x}'.format(color[0], color[1], color[2]))
+        
+        return hex_colors
+    except Exception as e:
+        print(f"Color Extraction Error: {e}")
+        return []
 
 def get_raw_vector(image_rgb):
     """Straight vectorization for the proactive endpoint. No CLAHE/DETR."""
@@ -129,7 +151,7 @@ def health():
 @app.route('/index-video-frame', methods=['POST'])
 def index_video_frame():
     """
-    Vectorizes raw frames, finds top 5 matches, 
+    Vectorizes raw frames, extracts colors, finds top 5 matches, 
     asks GPT to judge, and routes to correct table.
     """
     try:
@@ -139,34 +161,40 @@ def index_video_frame():
         image_url = data.get('image_url')
         video_setting = data.get('video_setting', "")
 
-        # 1. Get Raw Vector (No color grading/cropping)
+        # 1. Get Raw Image
         resp = requests.get(image_url, timeout=10)
         img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+        
+        # 2. Get Vector & Colors
         vector = get_raw_vector(img)
+        colors = extract_dominant_colors(img, k=3)
 
-        # 2. Get Top 5 Candidates via RPC
+        # 3. Get Top 5 Candidates via RPC
         rpc_res = supabase.rpc('match_products_advanced', {
             'query_embedding': vector, 
-            'query_colors': [], 
+            'query_colors': colors, 
             'match_threshold': 0.1, # Wide threshold to let GPT decide
             'match_count': 5
         }).execute()
         candidates = rpc_res.data or []
 
-        # 3. GPT Verification
+        # 4. GPT Verification
         judge_result = gpt_judge_match(image_url, candidates)
 
-        # 4. Storage Logic
+        # 5. Storage Logic
         supabase.table("videos").upsert({"id": video_id}).execute()
 
-        if judge_result.isdigit():
-            idx = int(judge_result) - 1
+        # Clean GPT response (safely extract just the digit)
+        clean_digit = "".join(filter(str.isdigit, judge_result))
+
+        if clean_digit:
+            idx = int(clean_digit) - 1
             if 0 <= idx < len(candidates):
                 winner = candidates[idx]
                 supabase.table("product_frames").insert({
                     "video_id": video_id,
                     "product_id": winner['id'],
-                    "embedding": vector,
+                    "embedding": vector.tolist() if hasattr(vector, 'tolist') else vector,
                     "frame_url": image_url
                 }).execute()
                 return jsonify({"status": "MATCHED", "product_id": winner['id']})
@@ -175,7 +203,7 @@ def index_video_frame():
         supabase.table("unmatched_leads").insert({
             "video_id": video_id,
             "image_url": image_url,
-            "embedding": vector,
+            "embedding": vector.tolist() if hasattr(vector, 'tolist') else vector,
             "video_setting": video_setting
         }).execute()
         return jsonify({"status": "UNMATCHED", "match": "NONE_STORED_AS_LEAD"})
