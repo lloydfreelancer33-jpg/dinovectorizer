@@ -7,5 +7,7 @@ supabase
 timm
 requests
 opencv-python-headless
+openai
+scikit-learn
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
