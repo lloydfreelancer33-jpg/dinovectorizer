@@ -5,6 +5,7 @@ import requests
 import cv2
 import numpy as np
 import torch
+import base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
@@ -137,7 +138,8 @@ def index_video_frame():
         vector = get_raw_vector(img)
         colors = extract_dominant_colors(img, k=3)
 
-        rpc_res = supabase.rpc('match_products_advanced', {
+        # UPDATED: Using the Unified RPC
+        rpc_res = supabase.rpc('match_unified_products', {
             'query_embedding': vector, 'query_colors': colors, 'match_threshold': 0.1, 'match_count': 5
         }).execute()
         candidates = rpc_res.data or []
@@ -214,7 +216,9 @@ def match():
             final_img = img.crop((img.size[0]*0.25, img.size[1]*0.25, img.size[0]*0.75, img.size[1]*0.75))
 
         vector = get_raw_vector(final_img)
-        response = supabase.rpc('match_products_advanced', {
+        
+        # UPDATED: Using the Unified RPC
+        response = supabase.rpc('match_unified_products', {
             'query_embedding': vector, 'query_colors': [], 'match_threshold': 0.15, 'match_count': 5
         }).execute()
         
