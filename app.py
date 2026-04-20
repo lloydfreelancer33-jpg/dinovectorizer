@@ -1,12 +1,5 @@
 import os
-# Force writable cache for Leapcell/Serverless environments
-CACHE_DIR = '/tmp/huggingface'
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.environ['HF_HOME'] = CACHE_DIR
-os.environ['TRANSFORMERS_CACHE'] = CACHE_DIR
-
 import io
-import base64
 import gc
 import requests
 import cv2
@@ -17,14 +10,26 @@ from flask_cors import CORS
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModel, pipeline
 from openai import OpenAI
-from sklearn.cluster import KMeans # <-- Added for color extraction
+from sklearn.cluster import KMeans
+
+# --- CONFIG & CACHE ---
+CACHE_DIR = '/tmp/huggingface'
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.environ['HF_HOME'] = CACHE_DIR
+os.environ['TRANSFORMERS_CACHE'] = CACHE_DIR
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 app = Flask(__name__)
 CORS(app)
 
-# --- INITIALIZATION ---
+# --- GLOBAL VARIABLES ---
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 supabase = None
+
+# Global Model Holders (Lazy Loaded)
+_dino_processor = None
+_dino_model = None
+_obj_detector = None
 
 def init_db():
     global supabase
@@ -36,7 +41,23 @@ def init_db():
             supabase = create_client(url, key)
     return supabase is not None
 
-# --- PHASE 1 HELPERS (DO NOT CHANGE) ---
+def get_dino():
+    """Loads DINOv2 only when first needed."""
+    global _dino_processor, _dino_model
+    if _dino_model is None:
+        _dino_processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR)
+        _dino_model = AutoModel.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR).to(device)
+        _dino_model.eval()
+    return _dino_processor, _dino_model
+
+def get_detector():
+    """Loads DETR detector only when first needed."""
+    global _obj_detector
+    if _obj_detector is None:
+        _obj_detector = pipeline("object-detection", model="facebook/detr-resnet-50", device=device, model_kwargs={"cache_dir": CACHE_DIR})
+    return _obj_detector
+
+# --- HELPERS ---
 
 def apply_clahe(image_rgb):
     image_rgb.thumbnail((1000, 1000))
@@ -46,100 +67,56 @@ def apply_clahe(image_rgb):
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     return Image.fromarray(cv2.cvtColor(cv2.merge((clahe.apply(l_channel), a, b)), cv2.COLOR_LAB2RGB))
 
-def smart_crop(image_rgb, detector):
-    image_rgb.thumbnail((800, 800))
-    w, h = image_rgb.size
-    print("🔍 Running DETR object detection...")
-    detections = detector(image_rgb)
-    valid_detections = [d for d in detections if d['score'] > 0.3]
-    best = max(valid_detections, key=lambda x: x['score'], default=None)
-    
-    if best:
-        box = best['box']
-        pad_w = (box['xmax'] - box['xmin']) * 0.1
-        pad_h = (box['ymax'] - box['ymin']) * 0.1
-        left, top = max(0, box['xmin'] - pad_w), max(0, box['ymin'] - pad_h)
-        right, bottom = min(w, box['xmax'] + pad_w), min(h, box['ymax'] + pad_h)
-        return image_rgb.crop((left, top, right, bottom))
-    
-    # Fallback to center zoom
-    return image_rgb.crop((w * 0.25, h * 0.25, w * 0.75, h * 0.75))
-
-# --- PHASE 2 HELPERS (PROACTIVE RAW MATCHING) ---
-
 def extract_dominant_colors(image_rgb, k=3):
-    """Extracts k dominant hex colors from an image using K-Means."""
     try:
         img = image_rgb.copy()
         img.thumbnail((100, 100))
         img_np = np.array(img)
         pixels = img_np.reshape(-1, 3)
-
         kmeans = KMeans(n_clusters=k, n_init=10)
         kmeans.fit(pixels)
         colors = kmeans.cluster_centers_.astype(int)
-
-        hex_colors = []
-        for color in colors:
-            hex_colors.append('#{:02x}{:02x}{:02x}'.format(color[0], color[1], color[2]))
-        
-        return hex_colors
+        return ['#{:02x}{:02x}{:02x}'.format(c[0], c[1], c[2]) for c in colors]
     except Exception as e:
         print(f"Color Extraction Error: {e}")
         return []
 
 def get_raw_vector(image_rgb):
-    """Straight vectorization for the proactive endpoint. No CLAHE/DETR."""
+    processor, model = get_dino()
     image_rgb.thumbnail((512, 512))
-    processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR)
-    model = AutoModel.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR)
-    model.eval()
-
-    inputs = processor(images=image_rgb, return_tensors="pt")
+    inputs = processor(images=image_rgb, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
-    vector = outputs.last_hidden_state[:, 0, :].squeeze().tolist()[:768]
-    
-    del processor, model
-    gc.collect()
-    return vector
+    return outputs.last_hidden_state[:, 0, :].squeeze().tolist()[:768]
 
 def gpt_judge_match(frame_url, candidates):
-    """Uses GPT-4o-mini to verify if any of the top 5 RPC results are an exact match."""
     if not candidates: return "NONE"
-
     options_text = ""
     for idx, c in enumerate(candidates):
         options_text += f"Choice {idx+1}: Product: {c.get('name', 'Item')}, ID: {c['id']}\n"
 
-    prompt = f"""
-    You are a precision product identification judge.
-    Below is a frame from a video and 5 potential matches from our shop.
-    
-    {options_text}
-    
-    Compare the video frame to the choices.
-    - If one choice is an EXACT match, return only the number (e.g., '2').
-    - If none match exactly, return 'NONE'.
-    - Do not explain yourself.
-    """
-
+    prompt = f"Compare the video frame to these choices. If one is an EXACT match, return only the number. If none match, return 'NONE'.\n\n{options_text}"
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": frame_url}}
-                ]
-            }],
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": frame_url}}
+            ]}],
             max_tokens=10
         )
         return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"GPT Judge Error: {e}")
+    except Exception:
         return "NONE"
+
+def apply_bbox_crop(image_rgb, bbox):
+    w, h = image_rgb.size
+    ymin, xmin, ymax, xmax = bbox
+    if max(bbox) > 1.1: 
+        left, top, right, bottom = (xmin/1000)*w, (ymin/1000)*h, (xmax/1000)*w, (ymax/1000)*h
+    else:
+        left, top, right, bottom = xmin*w, ymin*h, xmax*w, ymax*h
+    return image_rgb.crop((left, top, right, bottom))
 
 # --- ENDPOINTS ---
 
@@ -147,44 +124,26 @@ def gpt_judge_match(frame_url, candidates):
 def health():
     return "Online"
 
-# NEW ENDPOINT: PROACTIVE PHASE 2
 @app.route('/index-video-frame', methods=['POST'])
 def index_video_frame():
-    """
-    Vectorizes raw frames, extracts colors, finds top 5 matches, 
-    asks GPT to judge, and routes to correct table.
-    """
     try:
         if not init_db(): return jsonify({"error": "DB Init Failed"}), 500
         data = request.get_json()
-        video_id = data.get('video_id')
-        image_url = data.get('image_url')
-        video_setting = data.get('video_setting', "")
+        video_id, image_url, video_setting = data.get('video_id'), data.get('image_url'), data.get('video_setting', "")
 
-        # 1. Get Raw Image
         resp = requests.get(image_url, timeout=10)
         img = Image.open(io.BytesIO(resp.content)).convert('RGB')
         
-        # 2. Get Vector & Colors
         vector = get_raw_vector(img)
         colors = extract_dominant_colors(img, k=3)
 
-        # 3. Get Top 5 Candidates via RPC
         rpc_res = supabase.rpc('match_products_advanced', {
-            'query_embedding': vector, 
-            'query_colors': colors, 
-            'match_threshold': 0.1, # Wide threshold to let GPT decide
-            'match_count': 5
+            'query_embedding': vector, 'query_colors': colors, 'match_threshold': 0.1, 'match_count': 5
         }).execute()
         candidates = rpc_res.data or []
-
-        # 4. GPT Verification
         judge_result = gpt_judge_match(image_url, candidates)
 
-        # 5. Storage Logic
         supabase.table("videos").upsert({"id": video_id}).execute()
-
-        # Clean GPT response (safely extract just the digit)
         clean_digit = "".join(filter(str.isdigit, judge_result))
 
         if clean_digit:
@@ -192,101 +151,39 @@ def index_video_frame():
             if 0 <= idx < len(candidates):
                 winner = candidates[idx]
                 supabase.table("product_frames").insert({
-                    "video_id": video_id,
-                    "product_id": winner['id'],
-                    "embedding": vector.tolist() if hasattr(vector, 'tolist') else vector,
-                    "frame_url": image_url
+                    "video_id": video_id, "product_id": winner['id'], "embedding": vector, "frame_url": image_url
                 }).execute()
                 return jsonify({"status": "MATCHED", "product_id": winner['id']})
 
-        # No match found or judge said NONE
         supabase.table("unmatched_leads").insert({
-            "video_id": video_id,
-            "image_url": image_url,
-            "embedding": vector.tolist() if hasattr(vector, 'tolist') else vector,
-            "video_setting": video_setting
+            "video_id": video_id, "image_url": image_url, "embedding": vector, "video_setting": video_setting
         }).execute()
-        return jsonify({"status": "UNMATCHED", "match": "NONE_STORED_AS_LEAD"})
-
+        return jsonify({"status": "UNMATCHED"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-# --- NEW HELPER: PRECISE CROP FOR SEARCH ---
-
-def apply_bbox_crop(image_rgb, bbox):
-    """
-    Crops the image based on [ymin, xmin, ymax, xmax] coordinates from GPT.
-    Normalizes coordinates if they are in 0-1000 format (GPT standard).
-    """
-    w, h = image_rgb.size
-    ymin, xmin, ymax, xmax = bbox
-
-    # If GPT returns 0-1000 scale, convert to pixel scale
-    if max(bbox) > 1.1: 
-        left = (xmin / 1000) * w
-        top = (ymin / 1000) * h
-        right = (xmax / 1000) * w
-        bottom = (ymax / 1000) * h
-    else:
-        # Already normalized 0-1
-        left, top, right, bottom = xmin * w, ymin * h, xmax * w, ymax * h
-
-    return image_rgb.crop((left, top, right, bottom))
-
-# --- NEW ENDPOINT: REACTIVE PHASE 2 (Fast Search) ---
 
 @app.route('/search-frames', methods=['POST'])
 def search_frames():
-    """
-    Receives a screenshot and GPT-extracted coordinates.
-    Crops, vectorizes, and queries the product_frames library.
-    """
     try:
         if not init_db(): return jsonify({"error": "DB Init Failed"}), 500
         data = request.get_json()
-        image_url = data.get('image_url')
-        bbox = data.get('bbox') # Expected [ymin, xmin, ymax, xmax]
+        image_url, bbox = data.get('image_url'), data.get('bbox')
 
-        # 1. Fetch and Crop
         resp = requests.get(image_url, timeout=10)
         full_img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+        search_img = apply_bbox_crop(full_img, bbox) if bbox else full_img
         
-        if bbox:
-            search_img = apply_bbox_crop(full_img, bbox)
-        else:
-            # Fallback if no bbox provided
-            search_img = full_img
-            search_img.thumbnail((512, 512))
-
-        # 2. Vectorize the Crop
-        # This uses the same global DINO model to avoid cold starts
         vector = get_raw_vector(search_img)
-
-        # 3. Query the product_frames table specifically
-        # We use a new RPC 'match_video_frames' or reuse the advanced one
         rpc_res = supabase.rpc('match_video_frames', {
-            'query_embedding': vector,
-            'match_threshold': 0.12, # Precision match
-            'match_count': 3
+            'query_embedding': vector, 'match_threshold': 0.12, 'match_count': 3
         }).execute()
 
-        if rpc_res.data and len(rpc_res.data) > 0:
-            best_match = rpc_res.data[0]
-            return jsonify({
-                "status": "SUCCESS",
-                "best_match": {
-                    "product_id": best_match['product_id'],
-                    "confidence": best_match['similarity'],
-                    "frame_url": best_match['frame_url']
-                }
-            })
-
-        return jsonify({"status": "NO_FRAME_MATCH", "message": "No matching frames found in library."})
-
+        if rpc_res.data:
+            return jsonify({"status": "SUCCESS", "best_match": rpc_res.data[0]})
+        return jsonify({"status": "NO_FRAME_MATCH"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# OLD ENDPOINT (UNTOUCHED)
 @app.route('/match', methods=['POST'])
 def match():
     try:
@@ -296,39 +193,32 @@ def match():
 
         if image_data.startswith('http'):
             resp = requests.get(image_data, timeout=15)
-            image_rgb = Image.open(io.BytesIO(resp.content)).convert('RGB')
+            img = Image.open(io.BytesIO(resp.content)).convert('RGB')
         else:
             base64_str = image_data.split(',')[1] if ',' in image_data else image_data
-            image_rgb = Image.open(io.BytesIO(base64.b64decode(base64_str))).convert('RGB')
+            img = Image.open(io.BytesIO(base64.b64decode(base64_str))).convert('RGB')
         
-        image_rgb = apply_clahe(image_rgb)
-
-        detector = pipeline("object-detection", model="facebook/detr-resnet-50", model_kwargs={"cache_dir": CACHE_DIR})
-        final_image = smart_crop(image_rgb, detector)
-        del detector
-        gc.collect()
-
-        processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR)
-        model = AutoModel.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR)
-        model.eval()
-
-        inputs = processor(images=final_image, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model(**inputs)
-        vector = outputs.last_hidden_state[:, 0, :].squeeze().tolist()[:768]
+        img = apply_clahe(img)
+        detector = get_detector()
         
-        del processor, model
-        gc.collect()
+        # Smart Crop Logic
+        img.thumbnail((800, 800))
+        detections = detector(img)
+        valid = [d for d in detections if d['score'] > 0.3]
+        best = max(valid, key=lambda x: x['score'], default=None)
+        
+        if best:
+            box = best['box']
+            final_img = img.crop((box['xmin'], box['ymin'], box['xmax'], box['ymax']))
+        else:
+            final_img = img.crop((img.size[0]*0.25, img.size[1]*0.25, img.size[0]*0.75, img.size[1]*0.75))
 
+        vector = get_raw_vector(final_img)
         response = supabase.rpc('match_products_advanced', {
-            'query_embedding': vector, 
-            'query_colors': [], 
-            'match_threshold': 0.15, 
-            'match_count': 5
+            'query_embedding': vector, 'query_colors': [], 'match_threshold': 0.15, 'match_count': 5
         }).execute()
         
         return jsonify({"success": True, "matches": response.data})
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
