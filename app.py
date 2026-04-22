@@ -130,36 +130,41 @@ def index_video_frame():
     try:
         if not init_db(): return jsonify({"error": "DB Init Failed"}), 500
         data = request.get_json()
-        video_id, image_url, video_setting = data.get('video_id'), data.get('image_url'), data.get('video_setting', "")
+        video_id, image_data = data.get('video_id'), data.get('image_url')
 
-        resp = requests.get(image_url, timeout=10)
-        img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+        # Handle both URL and Base64 directly
+        if image_data.startswith('http'):
+            resp = requests.get(image_data, timeout=10)
+            img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+        else:
+            base64_str = image_data.split(',')[1] if ',' in image_data else image_data
+            img = Image.open(io.BytesIO(base64.b64decode(base64_str))).convert('RGB')
         
+        # Immediate Vectorization (No DETR/No BBox)
         vector = get_raw_vector(img)
         colors = extract_dominant_colors(img, k=3)
 
-        # UPDATED: Using the Unified RPC
+        # Match against existing products
         rpc_res = supabase.rpc('match_unified_products', {
             'query_embedding': vector, 'query_colors': colors, 'match_threshold': 0.1, 'match_count': 5
         }).execute()
+        
         candidates = rpc_res.data or []
-        judge_result = gpt_judge_match(image_url, candidates)
+        judge_result = gpt_judge_match(image_data, candidates)
 
+        # Record the video entry
         supabase.table("videos").upsert({"id": video_id}).execute()
+        
         clean_digit = "".join(filter(str.isdigit, judge_result))
-
         if clean_digit:
             idx = int(clean_digit) - 1
             if 0 <= idx < len(candidates):
                 winner = candidates[idx]
                 supabase.table("product_frames").insert({
-                    "video_id": video_id, "product_id": winner['id'], "embedding": vector, "frame_url": image_url
+                    "video_id": video_id, "product_id": winner['id'], "embedding": vector, "frame_url": "STORED_IN_AD_CREATIVES" 
                 }).execute()
                 return jsonify({"status": "MATCHED", "product_id": winner['id']})
 
-        supabase.table("unmatched_leads").insert({
-            "video_id": video_id, "image_url": image_url, "embedding": vector, "video_setting": video_setting
-        }).execute()
         return jsonify({"status": "UNMATCHED"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -169,13 +174,15 @@ def search_frames():
     try:
         if not init_db(): return jsonify({"error": "DB Init Failed"}), 500
         data = request.get_json()
-        image_url, bbox = data.get('image_url'), data.get('bbox')
+        image_url = data.get('image_url') # Removed bbox
 
+        # Fetch and process
         resp = requests.get(image_url, timeout=10)
-        full_img = Image.open(io.BytesIO(resp.content)).convert('RGB')
-        search_img = apply_bbox_crop(full_img, bbox) if bbox else full_img
+        search_img = Image.open(io.BytesIO(resp.content)).convert('RGB')
         
+        # Get vector directly from the full clean frame
         vector = get_raw_vector(search_img)
+        
         rpc_res = supabase.rpc('match_video_frames', {
             'query_embedding': vector, 'match_threshold': 0.12, 'match_count': 3
         }).execute()
