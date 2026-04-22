@@ -13,37 +13,43 @@ from transformers import AutoImageProcessor, AutoModel, pipeline
 from openai import OpenAI
 from sklearn.cluster import KMeans
 
-# --- CONFIG & CACHE ---
+# --- 1. ENVIRONMENT & HARDWARE CONFIG ---
 CACHE_DIR = '/tmp/huggingface'
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.environ['HF_HOME'] = CACHE_DIR
 os.environ['TRANSFORMERS_CACHE'] = CACHE_DIR
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 app = Flask(__name__)
 CORS(app)
 
-# --- GLOBAL VARIABLES ---
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-supabase = None
-
-# Global Model Holders (Lazy Loaded)
+# --- 2. LAZY-LOADED CLIENTS & MODELS ---
+# These stay 'None' until the first request hits to ensure 
+# the server passes health checks instantly.
+_supabase = None
+_openai_client = None
 _dino_processor = None
 _dino_model = None
 _obj_detector = None
 
-def init_db():
-    global supabase
-    if supabase is None:
+def get_supabase():
+    global _supabase
+    if _supabase is None:
         from supabase import create_client
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_ANON_KEY")
         if url and key:
-            supabase = create_client(url, key)
-    return supabase is not None
+            _supabase = create_client(url, key)
+    return _supabase
+
+def get_openai():
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _openai_client
 
 def get_dino():
-    """Loads DINOv2 only when first needed."""
     global _dino_processor, _dino_model
     if _dino_model is None:
         _dino_processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR)
@@ -52,13 +58,12 @@ def get_dino():
     return _dino_processor, _dino_model
 
 def get_detector():
-    """Loads DETR detector only when first needed."""
     global _obj_detector
     if _obj_detector is None:
         _obj_detector = pipeline("object-detection", model="facebook/detr-resnet-50", device=device, model_kwargs={"cache_dir": CACHE_DIR})
     return _obj_detector
 
-# --- HELPERS ---
+# --- 3. PROCESSING HELPERS ---
 
 def apply_clahe(image_rgb):
     image_rgb.thumbnail((1000, 1000))
@@ -91,7 +96,9 @@ def get_raw_vector(image_rgb):
     return outputs.last_hidden_state[:, 0, :].squeeze().tolist()[:768]
 
 def gpt_judge_match(frame_url, candidates):
+    client = get_openai()
     if not candidates: return "NONE"
+    
     options_text = ""
     for idx, c in enumerate(candidates):
         options_text += f"Choice {idx+1}: Product: {c.get('name', 'Item')}, ID: {c['id']}\n"
@@ -110,29 +117,21 @@ def gpt_judge_match(frame_url, candidates):
     except Exception:
         return "NONE"
 
-def apply_bbox_crop(image_rgb, bbox):
-    w, h = image_rgb.size
-    ymin, xmin, ymax, xmax = bbox
-    if max(bbox) > 1.1: 
-        left, top, right, bottom = (xmin/1000)*w, (ymin/1000)*h, (xmax/1000)*w, (ymax/1000)*h
-    else:
-        left, top, right, bottom = xmin*w, ymin*h, xmax*w, ymax*h
-    return image_rgb.crop((left, top, right, bottom))
-
-# --- ENDPOINTS ---
+# --- 4. ENDPOINTS ---
 
 @app.route('/')
 def health():
-    return "Online"
+    return "Online", 200
 
 @app.route('/index-video-frame', methods=['POST'])
 def index_video_frame():
+    sb = get_supabase()
+    if not sb: return jsonify({"error": "DB Init Failed"}), 500
+    
     try:
-        if not init_db(): return jsonify({"error": "DB Init Failed"}), 500
         data = request.get_json()
         video_id, image_data = data.get('video_id'), data.get('image_url')
 
-        # Handle both URL and Base64 directly
         if image_data.startswith('http'):
             resp = requests.get(image_data, timeout=10)
             img = Image.open(io.BytesIO(resp.content)).convert('RGB')
@@ -140,28 +139,28 @@ def index_video_frame():
             base64_str = image_data.split(',')[1] if ',' in image_data else image_data
             img = Image.open(io.BytesIO(base64.b64decode(base64_str))).convert('RGB')
         
-        # Immediate Vectorization (No DETR/No BBox)
         vector = get_raw_vector(img)
         colors = extract_dominant_colors(img, k=3)
 
-        # Match against existing products
-        rpc_res = supabase.rpc('match_unified_products', {
+        rpc_res = sb.rpc('match_unified_products', {
             'query_embedding': vector, 'query_colors': colors, 'match_threshold': 0.1, 'match_count': 5
         }).execute()
         
         candidates = rpc_res.data or []
         judge_result = gpt_judge_match(image_data, candidates)
 
-        # Record the video entry
-        supabase.table("videos").upsert({"id": video_id}).execute()
+        sb.table("videos").upsert({"id": video_id}).execute()
         
         clean_digit = "".join(filter(str.isdigit, judge_result))
         if clean_digit:
             idx = int(clean_digit) - 1
             if 0 <= idx < len(candidates):
                 winner = candidates[idx]
-                supabase.table("product_frames").insert({
-                    "video_id": video_id, "product_id": winner['id'], "embedding": vector, "frame_url": "STORED_IN_AD_CREATIVES" 
+                sb.table("product_frames").insert({
+                    "video_id": video_id, 
+                    "product_id": winner['id'], 
+                    "embedding": vector, 
+                    "frame_url": "STORED_IN_AD_CREATIVES" 
                 }).execute()
                 return jsonify({"status": "MATCHED", "product_id": winner['id']})
 
@@ -171,19 +170,17 @@ def index_video_frame():
 
 @app.route('/search-frames', methods=['POST'])
 def search_frames():
+    sb = get_supabase()
+    if not sb: return jsonify({"error": "DB Init Failed"}), 500
+    
     try:
-        if not init_db(): return jsonify({"error": "DB Init Failed"}), 500
         data = request.get_json()
-        image_url = data.get('image_url') # Removed bbox
-
-        # Fetch and process
+        image_url = data.get('image_url')
         resp = requests.get(image_url, timeout=10)
         search_img = Image.open(io.BytesIO(resp.content)).convert('RGB')
         
-        # Get vector directly from the full clean frame
         vector = get_raw_vector(search_img)
-        
-        rpc_res = supabase.rpc('match_video_frames', {
+        rpc_res = sb.rpc('match_video_frames', {
             'query_embedding': vector, 'match_threshold': 0.12, 'match_count': 3
         }).execute()
 
@@ -195,8 +192,10 @@ def search_frames():
 
 @app.route('/match', methods=['POST'])
 def match():
+    sb = get_supabase()
+    if not sb: return jsonify({"error": "DB Init Failed"}), 500
+    
     try:
-        if not init_db(): return jsonify({"error": "DB Init Failed"}), 500
         data = request.get_json()
         image_data = data.get('image')
 
@@ -210,7 +209,6 @@ def match():
         img = apply_clahe(img)
         detector = get_detector()
         
-        # Smart Crop Logic
         img.thumbnail((800, 800))
         detections = detector(img)
         valid = [d for d in detections if d['score'] > 0.3]
@@ -223,9 +221,7 @@ def match():
             final_img = img.crop((img.size[0]*0.25, img.size[1]*0.25, img.size[0]*0.75, img.size[1]*0.75))
 
         vector = get_raw_vector(final_img)
-        
-        # UPDATED: Using the Unified RPC
-        response = supabase.rpc('match_unified_products', {
+        response = sb.rpc('match_unified_products', {
             'query_embedding': vector, 'query_colors': [], 'match_threshold': 0.15, 'match_count': 5
         }).execute()
         
