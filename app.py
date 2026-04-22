@@ -9,7 +9,7 @@ import base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
-from transformers import AutoImageProcessor, AutoModel, pipeline
+from transformers import AutoImageProcessor, AutoModel
 from openai import OpenAI
 from sklearn.cluster import KMeans
 
@@ -19,19 +19,19 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 os.environ['HF_HOME'] = CACHE_DIR
 os.environ['TRANSFORMERS_CACHE'] = CACHE_DIR
 
+# Use GPU if available, otherwise CPU
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 app = Flask(__name__)
 CORS(app)
 
 # --- 2. LAZY-LOADED CLIENTS & MODELS ---
-# These stay 'None' until the first request hits to ensure 
-# the server passes health checks instantly.
+# Using global variables and getter functions to ensure the Flask app 
+# starts instantly to pass Leapcell health checks.
 _supabase = None
 _openai_client = None
 _dino_processor = None
 _dino_model = None
-_obj_detector = None
 
 def get_supabase():
     global _supabase
@@ -50,28 +50,36 @@ def get_openai():
     return _openai_client
 
 def get_dino():
+    """Loads DINOv2 Base (Memory-optimized with lazy loading)."""
     global _dino_processor, _dino_model
     if _dino_model is None:
-        _dino_processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR)
-        _dino_model = AutoModel.from_pretrained('facebook/dinov2-base', cache_dir=CACHE_DIR).to(device)
+        # Using Base model as requested for highest quality
+        model_id = 'facebook/dinov2-base'
+        _dino_processor = AutoImageProcessor.from_pretrained(model_id, cache_dir=CACHE_DIR)
+        _dino_model = AutoModel.from_pretrained(model_id, cache_dir=CACHE_DIR).to(device)
         _dino_model.eval()
+        gc.collect()
     return _dino_processor, _dino_model
-
-def get_detector():
-    global _obj_detector
-    if _obj_detector is None:
-        _obj_detector = pipeline("object-detection", model="facebook/detr-resnet-50", device=device, model_kwargs={"cache_dir": CACHE_DIR})
-    return _obj_detector
 
 # --- 3. PROCESSING HELPERS ---
 
-def apply_clahe(image_rgb):
-    image_rgb.thumbnail((1000, 1000))
-    img_np = np.array(image_rgb.convert('RGB'))
-    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
-    l_channel, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    return Image.fromarray(cv2.cvtColor(cv2.merge((clahe.apply(l_channel), a, b)), cv2.COLOR_LAB2RGB))
+def get_vector(image_rgb):
+    """
+    Generates 768-dim vector. 
+    Uses a center-crop focus to maintain quality without the heavy DETR model.
+    """
+    processor, model = get_dino()
+    
+    # Focus on the center area where products usually are (70% crop)
+    w, h = image_rgb.size
+    left, top, right, bottom = w*0.15, h*0.15, w*0.85, h*0.85
+    crop = image_rgb.crop((left, top, right, bottom))
+    crop.thumbnail((512, 512))
+    
+    inputs = processor(images=crop, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state[:, 0, :].squeeze().tolist()[:768]
 
 def extract_dominant_colors(image_rgb, k=3):
     try:
@@ -86,14 +94,6 @@ def extract_dominant_colors(image_rgb, k=3):
     except Exception as e:
         print(f"Color Extraction Error: {e}")
         return []
-
-def get_raw_vector(image_rgb):
-    processor, model = get_dino()
-    image_rgb.thumbnail((512, 512))
-    inputs = processor(images=image_rgb, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    return outputs.last_hidden_state[:, 0, :].squeeze().tolist()[:768]
 
 def gpt_judge_match(frame_url, candidates):
     client = get_openai()
@@ -121,7 +121,8 @@ def gpt_judge_match(frame_url, candidates):
 
 @app.route('/')
 def health():
-    return "Online", 200
+    """Health check endpoint for Leapcell proxy."""
+    return "Dino-Base Worker Online", 200
 
 @app.route('/index-video-frame', methods=['POST'])
 def index_video_frame():
@@ -139,11 +140,16 @@ def index_video_frame():
             base64_str = image_data.split(',')[1] if ',' in image_data else image_data
             img = Image.open(io.BytesIO(base64.b64decode(base64_str))).convert('RGB')
         
-        vector = get_raw_vector(img)
+        # High quality vectorization
+        vector = get_vector(img)
         colors = extract_dominant_colors(img, k=3)
 
+        # RPC call for vector matching
         rpc_res = sb.rpc('match_unified_products', {
-            'query_embedding': vector, 'query_colors': colors, 'match_threshold': 0.1, 'match_count': 5
+            'query_embedding': vector, 
+            'query_colors': colors, 
+            'match_threshold': 0.1, 
+            'match_count': 5
         }).execute()
         
         candidates = rpc_res.data or []
@@ -179,9 +185,11 @@ def search_frames():
         resp = requests.get(image_url, timeout=10)
         search_img = Image.open(io.BytesIO(resp.content)).convert('RGB')
         
-        vector = get_raw_vector(search_img)
+        vector = get_vector(search_img)
         rpc_res = sb.rpc('match_video_frames', {
-            'query_embedding': vector, 'match_threshold': 0.12, 'match_count': 3
+            'query_embedding': vector, 
+            'match_threshold': 0.12, 
+            'match_count': 3
         }).execute()
 
         if rpc_res.data:
@@ -190,8 +198,41 @@ def search_frames():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/vectorize', methods=['POST'])
+def vectorize_image():
+    """
+    Dedicated endpoint to get a raw vector for any image.
+    Useful for ad-hoc searches or manual database updates.
+    """
+    try:
+        data = request.get_json()
+        image_data = data.get('image') or data.get('image_url')
+
+        if not image_data:
+            return jsonify({"error": "No image data provided"}), 400
+
+        # Standard decoding logic used in your other endpoints
+        if image_data.startswith('http'):
+            resp = requests.get(image_data, timeout=10)
+            img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+        else:
+            base64_str = image_data.split(',')[1] if ',' in image_data else image_data
+            img = Image.open(io.BytesIO(base64.b64decode(base64_str))).convert('RGB')
+        
+        # Get the high-quality DINOv2 Base vector
+        vector = get_vector(img)
+        
+        return jsonify({
+            "success": True, 
+            "embedding": vector,
+            "dimensions": len(vector)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/match', methods=['POST'])
 def match():
+    """Lean /match endpoint using only DinoV2 Base and Center Crop focus."""
     sb = get_supabase()
     if not sb: return jsonify({"error": "DB Init Failed"}), 500
     
@@ -206,23 +247,14 @@ def match():
             base64_str = image_data.split(',')[1] if ',' in image_data else image_data
             img = Image.open(io.BytesIO(base64.b64decode(base64_str))).convert('RGB')
         
-        img = apply_clahe(img)
-        detector = get_detector()
+        # Consistent high-quality vectorization
+        vector = get_vector(img)
         
-        img.thumbnail((800, 800))
-        detections = detector(img)
-        valid = [d for d in detections if d['score'] > 0.3]
-        best = max(valid, key=lambda x: x['score'], default=None)
-        
-        if best:
-            box = best['box']
-            final_img = img.crop((box['xmin'], box['ymin'], box['xmax'], box['ymax']))
-        else:
-            final_img = img.crop((img.size[0]*0.25, img.size[1]*0.25, img.size[0]*0.75, img.size[1]*0.75))
-
-        vector = get_raw_vector(final_img)
         response = sb.rpc('match_unified_products', {
-            'query_embedding': vector, 'query_colors': [], 'match_threshold': 0.15, 'match_count': 5
+            'query_embedding': vector, 
+            'query_colors': [], 
+            'match_threshold': 0.15, 
+            'match_count': 5
         }).execute()
         
         return jsonify({"success": True, "matches": response.data})
